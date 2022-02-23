@@ -32,9 +32,31 @@ class TestFirewall(unittest.TestCase):
             __file__), os.pardir, "firewall"), update=True)
 
     def test2_create_probe(self):
-        probe = controller.get_plugin('firewall').Firewall(
-            name="attempt", interface="lo")
-        controller.create_probe(probe)
+        controller.create_probe('firewall', "attempt", interface="lo")
+
+    def test3_insert_rule(self):
+        rule = controller.get_plugin('firewall').FirewallRule(src='8.8.8.8')
+        p = controller.get_probe('firewall', 'attempt')
+        p.insert('ingress', rule)
+        assert len(p.get('ingress')) == 1
+
+    def test4_insert_error(self):
+        rule = controller.get_plugin('firewall').FirewallRule(src='8.8.8.8')
+        p = controller.get_probe('firewall', 'attempt')
+        with self.assertRaises(LookupError):
+            p.insert('ingress', rule)
+
+    def test5_delete_rule(self):
+        rule = controller.get_plugin('firewall').FirewallRule(src='8.8.8.8')
+        p = controller.get_probe('firewall', 'attempt')
+        p.delete('ingress', rule)
+        assert len(p.get('ingress')) == 0
+
+    def test6_insert_at_error(self):
+        rule = controller.get_plugin('firewall').FirewallRule(src='8.8.8.8')
+        p = controller.get_probe('firewall', 'attempt')
+        with self.assertRaises(IndexError):
+            p.insert_at('ingress', 10, rule)
 
 
 if __name__ == '__main__':

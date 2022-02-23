@@ -13,14 +13,14 @@
 # limitations under the License.
 import ctypes as ct
 from dataclasses import dataclass, field
-
 from math import ceil
-from typing import ClassVar, Dict, List
+from typing import Callable, ClassVar, Dict, List
 
-from dechainy.ebpf import BPF, LpmKey, ProbeCompilation
-from dechainy.utility import protocol_to_int, ipv4_to_network_int, port_to_network_int
+from dechainy.ebpf import BPF
 from dechainy.exceptions import HookDisabledException
 from dechainy.plugins import Probe
+from dechainy.utility import (ipv4_to_network_int, port_to_network_int,
+                              protocol_to_int)
 
 
 @dataclass
@@ -61,7 +61,7 @@ class Firewall(Probe):
     _rule_ids_word_per_entry: ClassVar[int] = 10
 
     _max_rules: int = 1000
-    __rules: Dict[str, List[FirewallRule]] = field(default_factory=lambda: {})
+    __rules: Dict[str, List[FirewallRule]] = field(default_factory=dict)
 
     def __post_init__(self):
         if not self.egress.required:
@@ -77,8 +77,7 @@ class Firewall(Probe):
                     self.__rules[hook] = []
         super().__post_init__(path=__file__)
 
-    def post_compilation(self, comp: ProbeCompilation):
-        super().post_compilation(comp)
+    def post_compilation(self):
         for hook in ["ingress", "egress"]:
             if hook in self.__rules and self.__rules[hook]:
                 [self.insert(hook, x) for x in self.__rules[hook]]
@@ -136,7 +135,7 @@ class Firewall(Probe):
             raise IndexError("The Rule ID provided is wrong")
         self.__rules[program_type].pop(rule_id)
         word, offset_ok = (rule_id // 64, 64 - rule_id % 64)
-        prog = getattr(self._programs, program_type)
+        prog = self[program_type]
 
         # Foreach map, also for the WILDCARDS ones, iterate through every
         # key-value and shift left the rules by 1, to remove the target one
@@ -146,14 +145,14 @@ class Firewall(Probe):
                 cnt_zeros = 0
                 carry = 0
                 # Starting from right to left
-                for w in range(self.rule_ids_word_per_entry - 1, word, -1):
+                for w in range(self._rule_ids_word_per_entry - 1, word, -1):
                     cnt_zeros += int(arr[w] == 0)
                     tmp = carry
                     carry = arr[w] >> 63
                     arr[w] = (arr[w] << 1) | tmp
                 cnt_zeros += int(arr[word] == 0)
                 # If all zeros, then remove the entire entry
-                if cnt_zeros == self.rule_ids_word_per_entry:
+                if cnt_zeros == self._rule_ids_word_per_entry:
                     del prog[map_name][key]
                     continue
                 # Finishing the current word, which has also the offset into account
@@ -206,13 +205,13 @@ class Firewall(Probe):
                 "Attempting to insert a rule which is already present")
         if rule_id > len(self.__rules[program_type]):
             raise IndexError("The Rule ID provided is wrong")
-        if rule_id == self.max_rules:
+        if rule_id == self._max_rules:
             raise MemoryError("You reached the maximum amount of rules")
 
         word, offset = (rule_id // 64, 63 - rule_id % 64)
         offset_ok = offset + 1
 
-        prog = getattr(self._programs, program_type)
+        prog = self[program_type]
         # If the id is in the middle of the list, then all the following rules has
         # to be shifted right by 1, for each map (also WILDCARDS)
         if rule_id < len(self.__rules[program_type]):
@@ -234,14 +233,14 @@ class Firewall(Probe):
 
         # Insert into the maps, at the specific position the value 1, according
         # to the values specified in the rule
-        for map_name, value in zip(Firewall._MAPS, Firewall.translate_rule(rule)):
+        for map_name, value in zip(Firewall._MAPS, Firewall.translate_rule(rule, prog['IPV4_SRC'].Key)):
             if value is None:
                 map_name = f'{map_name}_WILDCARDS'
                 value = 0
             if value in prog[map_name]:
                 arr = prog[map_name][value].rule_words
             else:
-                arr = (ct.c_uint64 * self.rule_ids_word_per_entry)()
+                arr = (ct.c_uint64 * self._rule_ids_word_per_entry)()
             arr[word] |= (1 << offset)
             prog[map_name][value] = arr
         prog['ACTIONS'][ct.c_uint32(
@@ -299,15 +298,16 @@ class Firewall(Probe):
         ret = len(self.__rules[program_type])
         self.__rules[program_type].clear()
         for map_name in Firewall._ALL_MAPS:
-            getattr(self._programs, program_type)[map_name].clear()
+            self[program_type][map_name].clear()
         return ret
 
     @staticmethod
-    def translate_rule(rule: FirewallRule) -> List[any]:
+    def translate_rule(rule: FirewallRule, LpmKey: Callable) -> List[any]:
         """Static function to translate a rule into values ready to be inserted in the eBPF maps.
 
         Args:
             rule (FirewallRule): The rule to be converted
+            LpmKey (Callable): The reference to the key structure to be invoked
 
         Returns:
             List[any]: List of converted fields using ctypes
